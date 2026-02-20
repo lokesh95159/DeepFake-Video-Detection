@@ -20,6 +20,8 @@ st.title("🎥 Video Manipulation Detection with Grad-CAM")
 MODEL_ID = "1X7xOD0rz_abVHpuSM3Gh_xVoe0ceerie"
 MODEL_PATH = "video_model.keras"
 MODEL_URL = f"https://drive.google.com/uc?id={MODEL_ID}"
+# Direct link for manual download (user-friendly)
+MANUAL_URL = f"https://drive.google.com/file/d/{MODEL_ID}/view?usp=sharing"
 
 # ==============================
 # Auto Cleanup (Delete After 5 Minutes)
@@ -36,8 +38,31 @@ cleanup_old_files()
 # Download Model If Needed
 # ==============================
 if not os.path.exists(MODEL_PATH):
-    with st.spinner("Downloading model from Google Drive..."):
-        gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
+    with st.spinner("Downloading model from Google Drive... (87 MB)"):
+        try:
+            # Download the file
+            gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
+            # Verify that the file was actually created and is not empty/corrupted
+            if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1e6:  # less than 1 MB
+                st.error(
+                    "❌ **Download failed.** The file may not be publicly accessible "
+                    "or Google Drive has blocked the download due to many requests.\n\n"
+                    f"Please open the following link in your browser and ensure the file "
+                    f"is shared with **'Anyone with the link'**:\n\n"
+                    f"🔗 [Open Model in Google Drive]({MANUAL_URL})\n\n"
+                    "After confirming sharing settings, restart the app. "
+                    "If the problem persists, try again later (quota may reset)."
+                )
+                st.stop()
+        except Exception as e:
+            st.error(f"❌ Download error: {e}")
+            st.stop()
+else:
+    # Optional: check if existing file is too small (corrupted)
+    if os.path.getsize(MODEL_PATH) < 1e6:
+        st.warning("Existing model file seems corrupted (too small). Re-downloading...")
+        os.remove(MODEL_PATH)
+        st.rerun()
 
 # ==============================
 # Sidebar Controls
@@ -79,7 +104,7 @@ def load_model():
             )
             return model
         except Exception as e2:
-            st.error("Failed to load model. Please ensure the model file is compatible with TensorFlow 2.15.")
+            st.error("❌ Failed to load model. Please ensure the model file is compatible with TensorFlow 2.15.")
             st.exception(e2)
             st.stop()
 
