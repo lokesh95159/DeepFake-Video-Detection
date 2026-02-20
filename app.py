@@ -8,22 +8,22 @@ import time
 import gdown
 from datetime import datetime, timedelta
 
-# ==============================
-# Page Config
-# ==============================
+# ==========================================================
+# PAGE CONFIG
+# ==========================================================
 st.set_page_config(page_title="Video Manipulation Detection", layout="wide")
 st.title("🎥 Video Manipulation Detection with Grad-CAM")
 
-# ==============================
-# Google Drive Model Setup
-# ==============================
-MODEL_ID = "1X7xOD0rz_abVHpuSM3Gh_xVoe0ceerie"
-MODEL_PATH = "video_model.keras"
-MODEL_URL = f"https://drive.google.com/uc?id={MODEL_ID}"
+# ==========================================================
+# MODEL CONFIG (YOUR .h5 MODEL)
+# ==========================================================
+FILE_ID = "1AINXnr-X5IgR3M8UV9TLjZPJcWBqflBQ"
+MODEL_PATH = "video_model.h5"
+MODEL_URL = f"https://drive.google.com/uc?id={FILE_ID}"
 
-# ==============================
-# Auto Cleanup (Delete After 5 Minutes)
-# ==============================
+# ==========================================================
+# AUTO DELETE OLD OUTPUT
+# ==========================================================
 def cleanup_old_files():
     if os.path.exists("processed_output.mp4"):
         file_time = datetime.fromtimestamp(os.path.getctime("processed_output.mp4"))
@@ -32,37 +32,35 @@ def cleanup_old_files():
 
 cleanup_old_files()
 
-# ==============================
-# Download Model If Needed
-# ==============================
+# ==========================================================
+# DOWNLOAD MODEL IF NOT EXISTS
+# ==========================================================
 if not os.path.exists(MODEL_PATH):
     with st.spinner("Downloading model from Google Drive..."):
         gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
 
-# ==============================
-# Sidebar Controls
-# ==============================
+# ==========================================================
+# SIDEBAR
+# ==========================================================
 st.sidebar.header("⚙️ Settings")
-
 threshold = st.sidebar.slider("Decision Threshold", 0.0, 1.0, 0.2, 0.01)
 alpha = st.sidebar.slider("Heatmap Intensity", 0.0, 1.0, 0.5, 0.05)
 
 CHUNK_SIZE = 8
-last_conv_layer_name = "time_distributed_2"
+LAST_CONV_LAYER = "time_distributed_2"
 
-# ==============================
-# Load Model (Cached)
-# ==============================
+# ==========================================================
+# LOAD MODEL (CACHE)
+# ==========================================================
 @st.cache_resource
 def load_model():
     return tf.keras.models.load_model(MODEL_PATH)
 
 model = load_model()
 
-# ==============================
-# Helper Functions
-# ==============================
-
+# ==========================================================
+# VIDEO PREPROCESSING
+# ==========================================================
 def load_and_preprocess_video(video_path):
     cap = cv2.VideoCapture(video_path)
     original_frames = []
@@ -80,40 +78,37 @@ def load_and_preprocess_video(video_path):
     cap.release()
     return original_frames, np.array(model_frames), fps
 
-
-def predict_video(model, video_batch):
-    return model(video_batch, training=False)
-
-
-def make_gradcam_heatmaps_for_chunk(model, chunk):
+# ==========================================================
+# GRAD-CAM
+# ==========================================================
+def make_gradcam_heatmaps(model, chunk):
     grad_model = tf.keras.models.Model(
         inputs=model.inputs,
-        outputs=[model.get_layer(last_conv_layer_name).output, model.output]
+        outputs=[model.get_layer(LAST_CONV_LAYER).output, model.output]
     )
 
-    chunk_tensor = tf.convert_to_tensor(chunk, dtype=tf.float32)
+    chunk_tensor = tf.convert_to_tensor(chunk)
 
     with tf.GradientTape() as tape:
-        conv_outputs, preds = grad_model(chunk_tensor, training=False)
-        loss = preds[:, 0] if preds.shape[-1] == 1 else tf.reduce_max(preds, axis=-1)
+        conv_outputs, predictions = grad_model(chunk_tensor)
+        loss = predictions[:, 0]
 
     grads = tape.gradient(loss, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 2, 3))
 
-    conv_outputs_np = conv_outputs.numpy()
-    pooled_np = pooled_grads.numpy()
+    conv_outputs = conv_outputs.numpy()
+    pooled_grads = pooled_grads.numpy()
 
     heatmaps = []
-    for f in range(conv_outputs_np.shape[1]):
-        conv_map = conv_outputs_np[0, f]
-        pooled = pooled_np[f]
-        heatmap = np.sum(conv_map * pooled[None, None, :], axis=-1)
+
+    for i in range(conv_outputs.shape[1]):
+        conv_map = conv_outputs[0, i]
+        heatmap = np.sum(conv_map * pooled_grads[i], axis=-1)
         heatmap = np.maximum(heatmap, 0)
-        heatmap /= (np.max(heatmap) + 1e-10)
-        heatmaps.append(heatmap.astype(np.float32))
+        heatmap /= (np.max(heatmap) + 1e-8)
+        heatmaps.append(heatmap)
 
     return heatmaps
-
 
 def overlay_heatmap(frame, heatmap):
     heatmap = cv2.resize(heatmap, (frame.shape[1], frame.shape[0]))
@@ -121,9 +116,9 @@ def overlay_heatmap(frame, heatmap):
     heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
     return cv2.addWeighted(frame, alpha, heatmap_color, 1 - alpha, 0)
 
-# ==============================
-# Upload Section
-# ==============================
+# ==========================================================
+# UI
+# ==========================================================
 uploaded_video = st.file_uploader("Upload Video", type=["mp4", "avi", "mov"])
 
 if uploaded_video is not None:
@@ -131,16 +126,14 @@ if uploaded_video is not None:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("📥 Original Video")
+        st.subheader("Original Video")
         st.video(uploaded_video)
 
-    if st.button("🚀 Start Processing"):
+    if st.button("Start Processing"):
 
         temp_input = tempfile.NamedTemporaryFile(delete=False)
         temp_input.write(uploaded_video.read())
         input_path = temp_input.name
-
-        st.info("Processing started...")
 
         original_frames, model_frames, fps = load_and_preprocess_video(input_path)
         num_frames = len(model_frames)
@@ -156,13 +149,7 @@ if uploaded_video is not None:
         )
 
         predictions = []
-        progress_bar = st.progress(0)
-
-        frame_text = st.empty()
-        fps_text = st.empty()
-
-        start_time = time.time()
-        processed_frames = 0
+        progress = st.progress(0)
 
         for start in range(0, num_frames, CHUNK_SIZE):
 
@@ -174,55 +161,41 @@ if uploaded_video is not None:
                 pad_frames = np.tile(chunk[-1:], (pad_len, 1, 1, 1))
                 chunk = np.concatenate((chunk, pad_frames), axis=0)
 
-            chunk = np.expand_dims(chunk, axis=0).astype(np.float32)
+            chunk = np.expand_dims(chunk, axis=0)
 
-            pred = predict_video(model, chunk)
-            predictions.append(float(np.array(pred)[0]))
+            pred = model(chunk)
+            predictions.append(float(pred.numpy()[0]))
 
-            heatmaps = make_gradcam_heatmaps_for_chunk(model, chunk)
+            heatmaps = make_gradcam_heatmaps(model, chunk)
 
             for j in range(end - start):
                 overlay = overlay_heatmap(original_frames[start + j], heatmaps[j])
                 out.write(overlay)
-                processed_frames += 1
 
-            elapsed = time.time() - start_time
-            current_fps = processed_frames / elapsed if elapsed > 0 else 0
-
-            progress_bar.progress(min(end / num_frames, 1.0))
-            frame_text.markdown(f"**Frames Processed:** {processed_frames}/{num_frames}")
-            fps_text.markdown(f"**Processing FPS:** {current_fps:.2f}")
+            progress.progress(min(end / num_frames, 1.0))
 
         out.release()
-        time.sleep(1)
 
-        overall_probability = np.mean(predictions)
-        result = "Manipulated" if overall_probability > threshold else "Real"
+        avg_prob = np.mean(predictions)
+        result = "Manipulated" if avg_prob > threshold else "Real"
 
         with col2:
-            st.subheader("📤 Processed Video")
+            st.subheader("Processed Video")
+            with open(output_path, "rb") as f:
+                video_bytes = f.read()
 
-            if os.path.exists(output_path):
-                with open(output_path, "rb") as f:
-                    video_bytes = f.read()
+            st.video(video_bytes)
 
-                st.video(video_bytes)
+            st.download_button(
+                "Download Processed Video",
+                data=video_bytes,
+                file_name="processed_video.mp4",
+                mime="video/mp4"
+            )
 
-                st.download_button(
-                    label="⬇️ Download Processed Video",
-                    data=video_bytes,
-                    file_name="processed_video.mp4",
-                    mime="video/mp4"
-                )
-
-                st.info("⚠️ File will auto-delete after 5 minutes.")
-
-            else:
-                st.error("Output video failed.")
-
-        st.subheader("📊 Final Results")
-        st.write(f"**Average Probability:** {overall_probability:.4f}")
-        st.write(f"**Threshold Used:** {threshold}")
-        st.write(f"**Final Decision:** {result}")
+        st.subheader("Final Results")
+        st.write(f"Average Probability: {avg_prob:.4f}")
+        st.write(f"Threshold: {threshold}")
+        st.write(f"Final Decision: {result}")
 
         os.remove(input_path)
