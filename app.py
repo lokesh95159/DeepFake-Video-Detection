@@ -5,7 +5,6 @@ import tensorflow as tf
 import tempfile
 import os
 import gdown
-import time
 from datetime import datetime, timedelta
 
 # ==========================================================
@@ -25,7 +24,7 @@ CHUNK_SIZE = 8
 LAST_CONV_LAYER = "time_distributed_2"
 
 # ==========================================================
-# CLEAN OLD OUTPUT
+# CLEAN OLD FILES
 # ==========================================================
 def cleanup_old_files():
     if os.path.exists("processed_output.mp4"):
@@ -40,19 +39,20 @@ cleanup_old_files()
 # ==========================================================
 def download_model():
     if not os.path.exists(MODEL_PATH):
-        with st.spinner("Downloading model..."):
+        with st.spinner("Downloading model from Google Drive..."):
             gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
 
 download_model()
 
 # ==========================================================
-# LOAD MODEL (FIXED FOR .h5)
+# LOAD MODEL (Keras 3 compatible)
 # ==========================================================
 @st.cache_resource
 def load_model():
     return tf.keras.models.load_model(
         MODEL_PATH,
-        compile=False
+        compile=False,
+        safe_mode=False
     )
 
 model = load_model()
@@ -65,7 +65,7 @@ threshold = st.sidebar.slider("Decision Threshold", 0.0, 1.0, 0.2, 0.01)
 alpha = st.sidebar.slider("Heatmap Intensity", 0.0, 1.0, 0.5, 0.05)
 
 # ==========================================================
-# VIDEO PREPROCESSING
+# VIDEO LOADING
 # ==========================================================
 def load_video(video_path):
     cap = cv2.VideoCapture(video_path)
@@ -89,8 +89,8 @@ def load_video(video_path):
 # ==========================================================
 def generate_gradcam(model, chunk):
     grad_model = tf.keras.models.Model(
-        [model.inputs],
-        [model.get_layer(LAST_CONV_LAYER).output, model.output]
+        inputs=model.inputs,
+        outputs=[model.get_layer(LAST_CONV_LAYER).output, model.output]
     )
 
     with tf.GradientTape() as tape:
@@ -143,7 +143,7 @@ if uploaded_video:
         num_frames = len(model_frames)
 
         if num_frames == 0:
-            st.error("Invalid or empty video.")
+            st.error("Invalid video.")
             st.stop()
 
         height, width, _ = original_frames[0].shape
