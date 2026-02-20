@@ -8,110 +8,116 @@ import time
 import gdown
 from datetime import datetime, timedelta
 
-# ==========================================
-# Page Configuration
-# ==========================================
-st.set_page_config(
-    page_title="Video Manipulation Detection",
-    layout="wide"
-)
-
+# ==============================
+# Page Config
+# ==============================
+st.set_page_config(page_title="Video Manipulation Detection", layout="wide")
 st.title("🎥 Video Manipulation Detection with Grad-CAM")
 
-# ==========================================
-# Model Configuration
-# ==========================================
+# ==============================
+# Google Drive Model Setup
+# ==============================
 MODEL_ID = "1X7xOD0rz_abVHpuSM3Gh_xVoe0ceerie"
 MODEL_PATH = "video_model.keras"
 MODEL_URL = f"https://drive.google.com/uc?id={MODEL_ID}"
 
-CHUNK_SIZE = 8
-LAST_CONV_LAYER_NAME = "time_distributed_2"
-
-# ==========================================
-# Cleanup Old Files (5 Minutes)
-# ==========================================
+# ==============================
+# Auto Cleanup (Delete After 5 Minutes)
+# ==============================
 def cleanup_old_files():
-    output_path = "processed_output.mp4"
-    if os.path.exists(output_path):
-        file_time = datetime.fromtimestamp(os.path.getctime(output_path))
+    if os.path.exists("processed_output.mp4"):
+        file_time = datetime.fromtimestamp(os.path.getctime("processed_output.mp4"))
         if datetime.now() - file_time > timedelta(minutes=5):
-            os.remove(output_path)
+            os.remove("processed_output.mp4")
 
 cleanup_old_files()
 
-# ==========================================
-# Download Model if Not Exists
-# ==========================================
+# ==============================
+# Download Model If Needed
+# ==============================
 if not os.path.exists(MODEL_PATH):
-    with st.spinner("Downloading model..."):
+    with st.spinner("Downloading model from Google Drive..."):
         gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
 
-# ==========================================
+# ==============================
 # Sidebar Controls
-# ==========================================
+# ==============================
 st.sidebar.header("⚙️ Settings")
 
-threshold = st.sidebar.slider(
-    "Decision Threshold", 0.0, 1.0, 0.2, 0.01
-)
+threshold = st.sidebar.slider("Decision Threshold", 0.0, 1.0, 0.2, 0.01)
+alpha = st.sidebar.slider("Heatmap Intensity", 0.0, 1.0, 0.5, 0.05)
 
-alpha = st.sidebar.slider(
-    "Heatmap Intensity", 0.0, 1.0, 0.5, 0.05
-)
+CHUNK_SIZE = 8
+# The name of the last convolutional layer in the model (adjust if needed)
+last_conv_layer_name = "time_distributed_2"
 
-# ==========================================
-# Load Model (Cached)
-# ==========================================
+# ==============================
+# Load Model (Cached) with Error Handling
+# ==============================
 @st.cache_resource
 def load_model():
-    return tf.keras.models.load_model(MODEL_PATH, compile=False)
+    """Load the Keras model with compatibility fallback."""
+    try:
+        # First attempt: standard load with compile=False
+        model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+        return model
+    except Exception as e:
+        st.warning("Standard model loading failed. Attempting with custom objects...")
+        # Some models need specific layers to be passed (e.g., TimeDistributed)
+        custom_objs = {
+            'TimeDistributed': tf.keras.layers.TimeDistributed,
+            'Conv2D': tf.keras.layers.Conv2D,
+            'MaxPooling2D': tf.keras.layers.MaxPooling2D,
+            'Flatten': tf.keras.layers.Flatten,
+            'LSTM': tf.keras.layers.LSTM,
+            'Dense': tf.keras.layers.Dense,
+            'Dropout': tf.keras.layers.Dropout,
+        }
+        try:
+            model = tf.keras.models.load_model(
+                MODEL_PATH, compile=False, custom_objects=custom_objs
+            )
+            return model
+        except Exception as e2:
+            st.error("Failed to load model. Please ensure the model file is compatible with TensorFlow 2.15.")
+            st.exception(e2)
+            st.stop()
 
+# Try to load the model; if it fails, the app will stop with a message
 model = load_model()
 
-# ==========================================
-# Video Preprocessing
-# ==========================================
+# ==============================
+# Helper Functions
+# ==============================
+
 def load_and_preprocess_video(video_path):
     cap = cv2.VideoCapture(video_path)
-
     original_frames = []
     model_frames = []
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 25.0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
         original_frames.append(frame)
-
-        resized = cv2.resize(frame, (224, 224))
-        resized = resized.astype(np.float32) / 255.0
-        model_frames.append(resized)
+        resized = cv2.resize(frame, (224, 224)) / 255.0
+        model_frames.append(resized.astype(np.float32))
 
     cap.release()
-
     return original_frames, np.array(model_frames), fps
 
-# ==========================================
-# Prediction
-# ==========================================
-def predict_video(model, video_batch):
-    prediction = model(video_batch, training=False)
-    return prediction.numpy()
 
-# ==========================================
-# GradCAM
-# ==========================================
+def predict_video(model, video_batch):
+    return model(video_batch, training=False)
+
+
 def make_gradcam_heatmaps_for_chunk(model, chunk):
+    # Build a sub-model that outputs the conv layer and predictions
     grad_model = tf.keras.models.Model(
-        inputs=model.input,
+        inputs=model.inputs,
         outputs=[
-            model.get_layer(LAST_CONV_LAYER_NAME).output,
+            model.get_layer(last_conv_layer_name).output,
             model.output
         ]
     )
@@ -119,58 +125,37 @@ def make_gradcam_heatmaps_for_chunk(model, chunk):
     chunk_tensor = tf.convert_to_tensor(chunk, dtype=tf.float32)
 
     with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(chunk_tensor, training=False)
-
-        if predictions.shape[-1] == 1:
-            loss = predictions[:, 0]
-        else:
-            loss = tf.reduce_max(predictions, axis=-1)
+        conv_outputs, preds = grad_model(chunk_tensor, training=False)
+        loss = preds[:, 0] if preds.shape[-1] == 1 else tf.reduce_max(preds, axis=-1)
 
     grads = tape.gradient(loss, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 2, 3))
 
-    conv_outputs = conv_outputs.numpy()
-    pooled_grads = pooled_grads.numpy()
+    conv_outputs_np = conv_outputs.numpy()
+    pooled_np = pooled_grads.numpy()
 
     heatmaps = []
-
-    for f in range(conv_outputs.shape[1]):
-        conv_map = conv_outputs[0, f]
-        pooled = pooled_grads[f]
-
+    for f in range(conv_outputs_np.shape[1]):
+        conv_map = conv_outputs_np[0, f]
+        pooled = pooled_np[f]
         heatmap = np.sum(conv_map * pooled[None, None, :], axis=-1)
         heatmap = np.maximum(heatmap, 0)
-        heatmap /= (np.max(heatmap) + 1e-8)
-
+        heatmap /= (np.max(heatmap) + 1e-10)
         heatmaps.append(heatmap.astype(np.float32))
 
     return heatmaps
 
-# ==========================================
-# Overlay Heatmap
-# ==========================================
+
 def overlay_heatmap(frame, heatmap):
-    heatmap = cv2.resize(
-        heatmap, (frame.shape[1], frame.shape[0])
-    )
-
+    heatmap = cv2.resize(heatmap, (frame.shape[1], frame.shape[0]))
     heatmap = np.uint8(255 * heatmap)
-    heatmap_color = cv2.applyColorMap(
-        heatmap, cv2.COLORMAP_JET
-    )
+    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    return cv2.addWeighted(frame, alpha, heatmap_color, 1 - alpha, 0)
 
-    overlay = cv2.addWeighted(
-        frame, alpha, heatmap_color, 1 - alpha, 0
-    )
-
-    return overlay
-
-# ==========================================
+# ==============================
 # Upload Section
-# ==========================================
-uploaded_video = st.file_uploader(
-    "Upload Video", type=["mp4", "avi", "mov"]
-)
+# ==============================
+uploaded_video = st.file_uploader("Upload Video", type=["mp4", "avi", "mov"])
 
 if uploaded_video is not None:
 
@@ -182,35 +167,30 @@ if uploaded_video is not None:
 
     if st.button("🚀 Start Processing"):
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_input:
-            temp_input.write(uploaded_video.read())
-            input_path = temp_input.name
+        temp_input = tempfile.NamedTemporaryFile(delete=False)
+        temp_input.write(uploaded_video.read())
+        input_path = temp_input.name
 
         st.info("Processing started...")
 
         original_frames, model_frames, fps = load_and_preprocess_video(input_path)
-
-        if len(original_frames) == 0:
-            st.error("Could not read video.")
-            st.stop()
-
         num_frames = len(model_frames)
 
         height, width, _ = original_frames[0].shape
         output_path = "processed_output.mp4"
 
-        # Codec fallback
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
         out = cv2.VideoWriter(
             output_path,
-            fourcc,
+            cv2.VideoWriter_fourcc(*'avc1'),
             fps,
             (width, height)
         )
 
         predictions = []
         progress_bar = st.progress(0)
+
+        frame_text = st.empty()
+        fps_text = st.empty()
 
         start_time = time.time()
         processed_frames = 0
@@ -222,34 +202,33 @@ if uploaded_video is not None:
 
             if len(chunk) < CHUNK_SIZE:
                 pad_len = CHUNK_SIZE - len(chunk)
-                pad = np.tile(chunk[-1:], (pad_len, 1, 1, 1))
-                chunk = np.concatenate((chunk, pad), axis=0)
+                pad_frames = np.tile(chunk[-1:], (pad_len, 1, 1, 1))
+                chunk = np.concatenate((chunk, pad_frames), axis=0)
 
             chunk = np.expand_dims(chunk, axis=0).astype(np.float32)
 
             pred = predict_video(model, chunk)
-            predictions.append(float(pred[0]))
+            predictions.append(float(np.array(pred)[0]))
 
             heatmaps = make_gradcam_heatmaps_for_chunk(model, chunk)
 
             for j in range(end - start):
-                overlay = overlay_heatmap(
-                    original_frames[start + j],
-                    heatmaps[j]
-                )
+                overlay = overlay_heatmap(original_frames[start + j], heatmaps[j])
                 out.write(overlay)
                 processed_frames += 1
 
+            elapsed = time.time() - start_time
+            current_fps = processed_frames / elapsed if elapsed > 0 else 0
+
             progress_bar.progress(min(end / num_frames, 1.0))
+            frame_text.markdown(f"**Frames Processed:** {processed_frames}/{num_frames}")
+            fps_text.markdown(f"**Processing FPS:** {current_fps:.2f}")
 
         out.release()
+        time.sleep(1)
 
-        overall_probability = float(np.mean(predictions))
-        result = (
-            "Manipulated"
-            if overall_probability > threshold
-            else "Real"
-        )
+        overall_probability = np.mean(predictions)
+        result = "Manipulated" if overall_probability > threshold else "Real"
 
         with col2:
             st.subheader("📤 Processed Video")
@@ -267,7 +246,8 @@ if uploaded_video is not None:
                     mime="video/mp4"
                 )
 
-                st.info("⚠️ File auto-deletes after 5 minutes.")
+                st.info("⚠️ File will auto-delete after 5 minutes.")
+
             else:
                 st.error("Output video failed.")
 
