@@ -20,7 +20,6 @@ st.title("🎥 Video Manipulation Detection with Grad-CAM")
 MODEL_ID = "1X7xOD0rz_abVHpuSM3Gh_xVoe0ceerie"
 MODEL_PATH = "video_model.keras"
 MODEL_URL = f"https://drive.google.com/uc?id={MODEL_ID}"
-# Direct link for manual download (user-friendly)
 MANUAL_URL = f"https://drive.google.com/file/d/{MODEL_ID}/view?usp=sharing"
 
 # ==============================
@@ -35,60 +34,65 @@ def cleanup_old_files():
 cleanup_old_files()
 
 # ==============================
-# Download Model If Needed
+# Model Acquisition (Download or Upload)
 # ==============================
-if not os.path.exists(MODEL_PATH):
-    with st.spinner("Downloading model from Google Drive... (87 MB)"):
-        try:
-            # Download the file
-            gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
-            # Verify that the file was actually created and is not empty/corrupted
-            if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1e6:  # less than 1 MB
-                st.error(
-                    "❌ **Download failed.** The file may not be publicly accessible "
-                    "or Google Drive has blocked the download due to many requests.\n\n"
-                    f"Please open the following link in your browser and ensure the file "
-                    f"is shared with **'Anyone with the link'**:\n\n"
-                    f"🔗 [Open Model in Google Drive]({MANUAL_URL})\n\n"
-                    "After confirming sharing settings, restart the app. "
-                    "If the problem persists, try again later (quota may reset)."
-                )
-                st.stop()
-        except Exception as e:
-            st.error(f"❌ Download error: {e}")
-            st.stop()
-else:
-    # Optional: check if existing file is too small (corrupted)
-    if os.path.getsize(MODEL_PATH) < 1e6:
-        st.warning("Existing model file seems corrupted (too small). Re-downloading...")
-        os.remove(MODEL_PATH)
-        st.rerun()
+def get_model_path():
+    """Return path to a valid model file, either downloaded or uploaded."""
+    # If already downloaded and valid, use it
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1e6:
+        return MODEL_PATH
+
+    # Try to download if file missing or too small
+    if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1e6:
+        with st.spinner("Downloading model from Google Drive... (87 MB)"):
+            try:
+                gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
+            except Exception as e:
+                st.warning(f"Automatic download failed: {e}")
+
+    # After download attempt, check again
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1e6:
+        return MODEL_PATH
+
+    # Download failed – offer manual upload
+    st.error(
+        "❌ **Could not download model automatically.**\n\n"
+        "Please ensure the file is publicly accessible. "
+        f"Open [this link]({MANUAL_URL}) and set sharing to 'Anyone with the link'.\n\n"
+        "Alternatively, upload the model file manually below."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload `video_model.keras`", type=["keras"], key="model_upload"
+    )
+
+    if uploaded_file is not None:
+        # Save uploaded file to a temporary location
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".keras")
+        tmp.write(uploaded_file.read())
+        tmp.close()
+        st.session_state["uploaded_model_path"] = tmp.name
+        st.success("Model uploaded successfully.")
+        return tmp.name
+
+    return None  # No valid model yet
+
+model_path = get_model_path()
+if model_path is None:
+    st.stop()  # Wait for user to upload or fix sharing
 
 # ==============================
-# Sidebar Controls
-# ==============================
-st.sidebar.header("⚙️ Settings")
-
-threshold = st.sidebar.slider("Decision Threshold", 0.0, 1.0, 0.2, 0.01)
-alpha = st.sidebar.slider("Heatmap Intensity", 0.0, 1.0, 0.5, 0.05)
-
-CHUNK_SIZE = 8
-# The name of the last convolutional layer in the model (adjust if needed)
-last_conv_layer_name = "time_distributed_2"
-
-# ==============================
-# Load Model (Cached) with Error Handling
+# Load Model (Cached)
 # ==============================
 @st.cache_resource
-def load_model():
+def load_model(path):
     """Load the Keras model with compatibility fallback."""
     try:
-        # First attempt: standard load with compile=False
-        model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+        # Standard load
+        model = tf.keras.models.load_model(path, compile=False)
         return model
     except Exception as e:
         st.warning("Standard model loading failed. Attempting with custom objects...")
-        # Some models need specific layers to be passed (e.g., TimeDistributed)
         custom_objs = {
             'TimeDistributed': tf.keras.layers.TimeDistributed,
             'Conv2D': tf.keras.layers.Conv2D,
@@ -100,7 +104,7 @@ def load_model():
         }
         try:
             model = tf.keras.models.load_model(
-                MODEL_PATH, compile=False, custom_objects=custom_objs
+                path, compile=False, custom_objects=custom_objs
             )
             return model
         except Exception as e2:
@@ -108,13 +112,22 @@ def load_model():
             st.exception(e2)
             st.stop()
 
-# Try to load the model; if it fails, the app will stop with a message
-model = load_model()
+model = load_model(model_path)
+
+# ==============================
+# Sidebar Controls
+# ==============================
+st.sidebar.header("⚙️ Settings")
+
+threshold = st.sidebar.slider("Decision Threshold", 0.0, 1.0, 0.2, 0.01)
+alpha = st.sidebar.slider("Heatmap Intensity", 0.0, 1.0, 0.5, 0.05)
+
+CHUNK_SIZE = 8
+last_conv_layer_name = "time_distributed_2"  # Adjust if needed
 
 # ==============================
 # Helper Functions
 # ==============================
-
 def load_and_preprocess_video(video_path):
     cap = cv2.VideoCapture(video_path)
     original_frames = []
@@ -138,7 +151,6 @@ def predict_video(model, video_batch):
 
 
 def make_gradcam_heatmaps_for_chunk(model, chunk):
-    # Build a sub-model that outputs the conv layer and predictions
     grad_model = tf.keras.models.Model(
         inputs=model.inputs,
         outputs=[
