@@ -7,7 +7,7 @@ import os
 import time
 import requests
 from datetime import datetime, timedelta
-import time as time_module  # for sleep in retries
+import time as time_module
 
 # ==============================
 # Page Config
@@ -47,17 +47,12 @@ CHUNK_SIZE = 8
 DEFAULT_CONV_LAYER = "time_distributed_2"
 
 # ==============================
-# Robust Download Function with Retries and Verification
+# Robust Download Function
 # ==============================
 def download_file_with_retry(url, destination, expected_size_mb=87, max_retries=3):
-    """
-    Download a file from a URL with retries and integrity verification.
-    Returns True if successful and file is a valid Keras model.
-    """
     for attempt in range(1, max_retries + 1):
         try:
             st.info(f"Download attempt {attempt}/{max_retries}...")
-            # Stream download with progress
             with requests.get(url, stream=True, timeout=30) as r:
                 r.raise_for_status()
                 total_size = int(r.headers.get('content-length', 0))
@@ -71,83 +66,69 @@ def download_file_with_retry(url, destination, expected_size_mb=87, max_retries=
                             progress_bar.progress(downloaded / total_size)
                 progress_bar.empty()
 
-            # Basic size check (allow some variation)
+            # Size sanity check
             file_size = os.path.getsize(destination)
-            min_acceptable = expected_size_mb * 0.9 * 1e6  # 90% of expected
+            min_acceptable = expected_size_mb * 0.9 * 1e6
             if file_size < min_acceptable:
-                st.warning(f"Downloaded file size ({file_size/1e6:.1f} MB) is below expected ({expected_size_mb} MB). Retrying...")
+                st.warning(f"File too small ({file_size/1e6:.1f} MB). Retrying...")
                 os.remove(destination)
                 continue
 
-            # Verify that it's a valid Keras model
+            # Quick load test (but we don't keep the model)
             try:
-                st.info("Verifying downloaded model...")
                 _ = tf.keras.models.load_model(destination, compile=False)
-                st.success("Model verified successfully.")
+                st.success("Model verified.")
                 return True
             except Exception as e:
-                st.warning(f"Downloaded file is not a valid Keras model: {e}")
+                st.warning(f"Downloaded file is not a valid model: {e}")
                 os.remove(destination)
-                # If not last attempt, wait before retrying
                 if attempt < max_retries:
-                    wait_time = 2 ** attempt  # exponential backoff
-                    st.info(f"Retrying in {wait_time} seconds...")
-                    time_module.sleep(wait_time)
+                    time_module.sleep(2 ** attempt)
                 continue
 
         except Exception as e:
-            st.warning(f"Download attempt {attempt} failed: {e}")
+            st.warning(f"Attempt {attempt} failed: {e}")
             if os.path.exists(destination):
                 os.remove(destination)
             if attempt < max_retries:
-                wait_time = 2 ** attempt
-                st.info(f"Retrying in {wait_time} seconds...")
-                time_module.sleep(wait_time)
+                time_module.sleep(2 ** attempt)
             continue
-
     return False
 
 # ==============================
-# Get Model Path (with robust download)
+# Get Model Path
 # ==============================
 def get_model_path():
-    # If already downloaded and valid, use it
+    # Use existing valid file
     if os.path.exists(MODEL_PATH):
         try:
-            # Quick check: try loading (but we don't want to keep it loaded yet)
             _ = tf.keras.models.load_model(MODEL_PATH, compile=False)
             return MODEL_PATH
         except:
-            st.warning("Existing model file is corrupted. Re-downloading...")
+            st.warning("Existing model file corrupted. Re‑downloading...")
             os.remove(MODEL_PATH)
 
-    # Determine which URL to use
-    download_url = custom_url if custom_url else GITHUB_MODEL_URL
-    source_name = "custom URL" if custom_url else "GitHub"
+    # Try custom URL first
+    if custom_url:
+        st.info(f"Downloading from custom URL...")
+        if download_file_with_retry(custom_url, MODEL_PATH):
+            return MODEL_PATH
+        else:
+            st.warning("Custom URL failed, falling back to default GitHub URL.")
 
-    st.info(f"Downloading model from {source_name}...")
-    if download_file_with_retry(download_url, MODEL_PATH):
+    # Then default GitHub URL
+    st.info("Downloading from GitHub...")
+    if download_file_with_retry(GITHUB_MODEL_URL, MODEL_PATH):
         return MODEL_PATH
 
-    # If custom URL failed and it's not the default, try the default as fallback
-    if custom_url and custom_url != GITHUB_MODEL_URL:
-        st.warning("Custom URL download failed. Falling back to default GitHub URL.")
-        if download_file_with_retry(GITHUB_MODEL_URL, MODEL_PATH):
-            return MODEL_PATH
-
-    # All download attempts failed – offer manual upload
-    st.error(
-        "❌ **Could not download model automatically after multiple attempts.**\n\n"
-        "Please upload the model file manually below."
-    )
+    # If all downloads fail, ask for manual upload
+    st.error("❌ Automatic download failed after multiple attempts. Please upload the model file.")
     uploaded_file = st.file_uploader("Upload `video_model.keras`", type=["keras"], key="model_upload")
     if uploaded_file is not None:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".keras")
         tmp.write(uploaded_file.read())
         tmp.close()
-        st.session_state["uploaded_model_path"] = tmp.name
         return tmp.name
-
     return None
 
 model_path = get_model_path()
@@ -155,44 +136,54 @@ if model_path is None:
     st.stop()
 
 # ==============================
-# Load Model (Cached)
+# Ultra‑Robust Model Loading
 # ==============================
 @st.cache_resource
 def load_model(path):
-    """Try multiple loading strategies to handle Keras 2/3 compatibility."""
     st.write(f"TensorFlow version: {tf.__version__}")
     try:
         import keras
         st.write(f"Keras version: {keras.__version__}")
     except ImportError:
-        st.write("Standalone keras not available, using tf.keras")
+        st.write("Standalone Keras not available, using tf.keras only.")
 
-    # Strategy 1: Standard tf.keras load
-    try:
-        st.write("Attempting to load with tf.keras.models.load_model...")
-        model = tf.keras.models.load_model(path, compile=False)
-        st.success("Model loaded successfully with tf.keras.")
-        return model
-    except Exception as e:
-        st.warning(f"tf.keras load failed: {e}")
-        with st.expander("Show full error"):
-            st.exception(e)
-
-    # Strategy 2: Standalone keras
+    # ---------- Strategy 1: Standalone Keras with safe_mode=False ----------
     try:
         import keras
-        st.write("Attempting to load with keras.models.load_model...")
-        model = keras.models.load_model(path)
-        st.success("Model loaded successfully with keras.")
+        st.write("Attempt 1: keras.models.load_model with safe_mode=False...")
+        model = keras.models.load_model(path, safe_mode=False)
+        st.success("✅ Loaded with standalone Keras (safe_mode=False)")
         return model
-    except ImportError:
-        st.warning("Standalone keras not available, skipping.")
     except Exception as e:
-        st.warning(f"keras load failed: {e}")
+        st.warning(f"Attempt 1 failed: {e}")
         with st.expander("Show full error"):
             st.exception(e)
 
-    # Strategy 3: Custom objects (common layers)
+    # ---------- Strategy 2: Standalone Keras without safe_mode ----------
+    try:
+        import keras
+        st.write("Attempt 2: keras.models.load_model (default)...")
+        model = keras.models.load_model(path)
+        st.success("✅ Loaded with standalone Keras")
+        return model
+    except Exception as e:
+        st.warning(f"Attempt 2 failed: {e}")
+        with st.expander("Show full error"):
+            st.exception(e)
+
+    # ---------- Strategy 3: tf.keras with safe_mode=False (if available) ----------
+    try:
+        st.write("Attempt 3: tf.keras.models.load_model with safe_mode=False...")
+        # safe_mode argument exists in TF 2.16+?
+        model = tf.keras.models.load_model(path, compile=False, safe_mode=False)
+        st.success("✅ Loaded with tf.keras (safe_mode=False)")
+        return model
+    except Exception as e:
+        st.warning(f"Attempt 3 failed: {e}")
+        with st.expander("Show full error"):
+            st.exception(e)
+
+    # ---------- Strategy 4: tf.keras with extensive custom objects ----------
     custom_objs = {
         'TimeDistributed': tf.keras.layers.TimeDistributed,
         'Conv2D': tf.keras.layers.Conv2D,
@@ -208,19 +199,51 @@ def load_model(path):
         'Flatten': tf.keras.layers.Flatten,
         'Dense': tf.keras.layers.Dense,
         'InputLayer': tf.keras.layers.InputLayer,
-        'Functional': tf.keras.models.Model,
+        'Functional': tf.keras.models.Model,          # critical for the inner model
     }
     try:
-        st.write("Attempting with custom objects...")
+        st.write("Attempt 4: tf.keras.models.load_model with custom objects...")
         model = tf.keras.models.load_model(path, compile=False, custom_objects=custom_objs)
-        st.success("Model loaded successfully with custom objects.")
+        st.success("✅ Loaded with tf.keras + custom objects")
         return model
     except Exception as e:
-        st.warning(f"Custom objects load failed: {e}")
+        st.warning(f"Attempt 4 failed: {e}")
         with st.expander("Show full error"):
             st.exception(e)
 
-    st.error("All loading attempts failed. Please ensure the model file is compatible with TensorFlow 2.16+.")
+    # ---------- Strategy 5: Monkey‑patch missing compute_output_shape ----------
+    try:
+        st.write("Attempt 5: Monkey‑patching Functional.compute_output_shape...")
+        # Ensure the base class has the method
+        if not hasattr(tf.keras.models.Model, 'compute_output_shape'):
+            def compute_output_shape(self, input_shape):
+                # fallback: try to call the layer on a dummy tensor to infer shape
+                import numpy as np
+                dummy = tf.zeros((1,) + input_shape[1:])
+                out = self(dummy, training=False)
+                return out.shape
+            tf.keras.models.Model.compute_output_shape = compute_output_shape
+            st.info("Monkey-patched compute_output_shape onto Model.")
+
+        # Also patch the specific Functional class if needed
+        try:
+            from keras.src.models.functional import Functional as KerasFunctional
+            if not hasattr(KerasFunctional, 'compute_output_shape'):
+                KerasFunctional.compute_output_shape = compute_output_shape
+        except ImportError:
+            pass
+
+        # Now try loading again with custom objects
+        model = tf.keras.models.load_model(path, compile=False, custom_objects=custom_objs)
+        st.success("✅ Loaded after monkey‑patching")
+        return model
+    except Exception as e:
+        st.warning(f"Attempt 5 failed: {e}")
+        with st.expander("Show full error"):
+            st.exception(e)
+
+    # ---------- Give up ----------
+    st.error("❌ All loading attempts failed. Please check that the model file is compatible with TensorFlow 2.16+.")
     st.stop()
 
 model = load_model(model_path)
@@ -247,7 +270,6 @@ def predict_video(model, video_batch):
     return model(video_batch, training=False)
 
 def find_last_conv_layer(model):
-    """Dynamically find the last Conv2D layer wrapped in TimeDistributed or not."""
     for layer in reversed(model.layers):
         if isinstance(layer, tf.keras.layers.TimeDistributed):
             inner_layer = layer.layer
@@ -290,7 +312,6 @@ def overlay_heatmap(frame, heatmap):
     heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
     return cv2.addWeighted(frame, alpha, heatmap_color, 1 - alpha, 0)
 
-# Dynamically determine last conv layer
 last_conv_layer_name = find_last_conv_layer(model)
 st.sidebar.info(f"Using conv layer: {last_conv_layer_name}")
 
