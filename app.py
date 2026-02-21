@@ -5,7 +5,7 @@ import tensorflow as tf
 import tempfile
 import os
 import time
-import gdown
+import requests
 from datetime import datetime, timedelta
 
 # ==============================
@@ -13,14 +13,6 @@ from datetime import datetime, timedelta
 # ==============================
 st.set_page_config(page_title="Video Manipulation Detection", layout="wide")
 st.title("🎥 Video Manipulation Detection with Grad-CAM")
-
-# ==============================
-# Google Drive Model Setup
-# ==============================
-MODEL_ID = "1X7xOD0rz_abVHpuSM3Gh_xVoe0ceerie"
-MODEL_PATH = "video_model.keras"
-MODEL_URL = f"https://drive.google.com/uc?id={MODEL_ID}"
-MANUAL_URL = f"https://drive.google.com/file/d/{MODEL_ID}/view?usp=sharing"
 
 # ==============================
 # Auto Cleanup (Delete After 5 Minutes)
@@ -34,40 +26,87 @@ def cleanup_old_files():
 cleanup_old_files()
 
 # ==============================
-# Model Acquisition (Download or Upload)
+# Model Source Configuration
+# ==============================
+# Your GitHub release direct download URL
+GITHUB_MODEL_URL = "https://github.com/lokesh95159/deepfake-model/releases/download/v1.0/video_classification_model_20250523_001615.keras"
+MODEL_PATH = "video_model.keras"
+
+# ==============================
+# Sidebar Settings
+# ==============================
+st.sidebar.header("⚙️ Settings")
+
+# Allow user to override with a custom URL
+custom_url = st.sidebar.text_input(
+    "Custom Model URL (optional)",
+    help="Paste a direct download link to your model file (e.g., from GitHub Releases)."
+)
+
+threshold = st.sidebar.slider("Decision Threshold", 0.0, 1.0, 0.2, 0.01)
+alpha = st.sidebar.slider("Heatmap Intensity", 0.0, 1.0, 0.5, 0.05)
+
+CHUNK_SIZE = 8
+last_conv_layer_name = "time_distributed_2"  # Adjust if your model uses a different name
+
+# ==============================
+# Download Model Function
+# ==============================
+def download_file(url, destination, expected_size_mb=87):
+    """Download a file from any URL with a progress bar."""
+    try:
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            total_size = int(r.headers.get('content-length', 0))
+            progress_bar = st.progress(0, text="Downloading model...")
+            with open(destination, 'wb') as f:
+                downloaded = 0
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size:
+                        progress_bar.progress(downloaded / total_size)
+            progress_bar.empty()
+        # Verify size
+        if os.path.getsize(destination) < expected_size_mb * 1e6:
+            st.warning("Downloaded file seems too small. It may be incomplete.")
+            return False
+        return True
+    except Exception as e:
+        st.error(f"Download failed: {e}")
+        return False
+
+# ==============================
+# Get Model Path (Download or Use Existing)
 # ==============================
 def get_model_path():
-    """Return path to a valid model file, either downloaded or uploaded."""
+    """Return path to a valid model file."""
     # If already downloaded and valid, use it
     if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1e6:
         return MODEL_PATH
 
-    # Try to download if file missing or too small
-    if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1e6:
-        with st.spinner("Downloading model from Google Drive... (87 MB)"):
-            try:
-                gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
-            except Exception as e:
-                st.warning(f"Automatic download failed: {e}")
+    # 1. Try custom URL if provided
+    if custom_url:
+        st.info("Downloading model from custom URL...")
+        if download_file(custom_url, MODEL_PATH):
+            return MODEL_PATH
+        else:
+            st.error("Custom URL download failed. Falling back to default GitHub URL.")
 
-    # After download attempt, check again
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1e6:
+    # 2. Try default GitHub URL
+    st.info("Downloading model from GitHub...")
+    if download_file(GITHUB_MODEL_URL, MODEL_PATH):
         return MODEL_PATH
 
-    # Download failed – offer manual upload
+    # 3. Manual upload fallback
     st.error(
         "❌ **Could not download model automatically.**\n\n"
-        "Please ensure the file is publicly accessible. "
-        f"Open [this link]({MANUAL_URL}) and set sharing to 'Anyone with the link'.\n\n"
-        "Alternatively, upload the model file manually below."
+        "Please upload the model file manually below."
     )
-
     uploaded_file = st.file_uploader(
         "Upload `video_model.keras`", type=["keras"], key="model_upload"
     )
-
     if uploaded_file is not None:
-        # Save uploaded file to a temporary location
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".keras")
         tmp.write(uploaded_file.read())
         tmp.close()
@@ -79,7 +118,7 @@ def get_model_path():
 
 model_path = get_model_path()
 if model_path is None:
-    st.stop()  # Wait for user to upload or fix sharing
+    st.stop()
 
 # ==============================
 # Load Model (Cached)
@@ -88,7 +127,6 @@ if model_path is None:
 def load_model(path):
     """Load the Keras model with compatibility fallback."""
     try:
-        # Standard load
         model = tf.keras.models.load_model(path, compile=False)
         return model
     except Exception as e:
@@ -108,22 +146,11 @@ def load_model(path):
             )
             return model
         except Exception as e2:
-            st.error("❌ Failed to load model. Please ensure the model file is compatible with TensorFlow 2.15.")
+            st.error("❌ Failed to load model. Ensure the model file is compatible with TensorFlow 2.15.")
             st.exception(e2)
             st.stop()
 
 model = load_model(model_path)
-
-# ==============================
-# Sidebar Controls
-# ==============================
-st.sidebar.header("⚙️ Settings")
-
-threshold = st.sidebar.slider("Decision Threshold", 0.0, 1.0, 0.2, 0.01)
-alpha = st.sidebar.slider("Heatmap Intensity", 0.0, 1.0, 0.5, 0.05)
-
-CHUNK_SIZE = 8
-last_conv_layer_name = "time_distributed_2"  # Adjust if needed
 
 # ==============================
 # Helper Functions
@@ -133,7 +160,6 @@ def load_and_preprocess_video(video_path):
     original_frames = []
     model_frames = []
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -141,14 +167,11 @@ def load_and_preprocess_video(video_path):
         original_frames.append(frame)
         resized = cv2.resize(frame, (224, 224)) / 255.0
         model_frames.append(resized.astype(np.float32))
-
     cap.release()
     return original_frames, np.array(model_frames), fps
 
-
 def predict_video(model, video_batch):
     return model(video_batch, training=False)
-
 
 def make_gradcam_heatmaps_for_chunk(model, chunk):
     grad_model = tf.keras.models.Model(
@@ -158,19 +181,14 @@ def make_gradcam_heatmaps_for_chunk(model, chunk):
             model.output
         ]
     )
-
     chunk_tensor = tf.convert_to_tensor(chunk, dtype=tf.float32)
-
     with tf.GradientTape() as tape:
         conv_outputs, preds = grad_model(chunk_tensor, training=False)
         loss = preds[:, 0] if preds.shape[-1] == 1 else tf.reduce_max(preds, axis=-1)
-
     grads = tape.gradient(loss, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 2, 3))
-
     conv_outputs_np = conv_outputs.numpy()
     pooled_np = pooled_grads.numpy()
-
     heatmaps = []
     for f in range(conv_outputs_np.shape[1]):
         conv_map = conv_outputs_np[0, f]
@@ -179,9 +197,7 @@ def make_gradcam_heatmaps_for_chunk(model, chunk):
         heatmap = np.maximum(heatmap, 0)
         heatmap /= (np.max(heatmap) + 1e-10)
         heatmaps.append(heatmap.astype(np.float32))
-
     return heatmaps
-
 
 def overlay_heatmap(frame, heatmap):
     heatmap = cv2.resize(heatmap, (frame.shape[1], frame.shape[0]))
@@ -190,32 +206,26 @@ def overlay_heatmap(frame, heatmap):
     return cv2.addWeighted(frame, alpha, heatmap_color, 1 - alpha, 0)
 
 # ==============================
-# Upload Section
+# Video Upload and Processing
 # ==============================
 uploaded_video = st.file_uploader("Upload Video", type=["mp4", "avi", "mov"])
 
 if uploaded_video is not None:
-
     col1, col2 = st.columns(2)
-
     with col1:
         st.subheader("📥 Original Video")
         st.video(uploaded_video)
 
     if st.button("🚀 Start Processing"):
-
         temp_input = tempfile.NamedTemporaryFile(delete=False)
         temp_input.write(uploaded_video.read())
         input_path = temp_input.name
 
         st.info("Processing started...")
-
         original_frames, model_frames, fps = load_and_preprocess_video(input_path)
         num_frames = len(model_frames)
-
         height, width, _ = original_frames[0].shape
         output_path = "processed_output.mp4"
-
         out = cv2.VideoWriter(
             output_path,
             cv2.VideoWriter_fourcc(*'avc1'),
@@ -225,23 +235,18 @@ if uploaded_video is not None:
 
         predictions = []
         progress_bar = st.progress(0)
-
         frame_text = st.empty()
         fps_text = st.empty()
-
         start_time = time.time()
         processed_frames = 0
 
         for start in range(0, num_frames, CHUNK_SIZE):
-
             end = min(start + CHUNK_SIZE, num_frames)
             chunk = model_frames[start:end]
-
             if len(chunk) < CHUNK_SIZE:
                 pad_len = CHUNK_SIZE - len(chunk)
                 pad_frames = np.tile(chunk[-1:], (pad_len, 1, 1, 1))
                 chunk = np.concatenate((chunk, pad_frames), axis=0)
-
             chunk = np.expand_dims(chunk, axis=0).astype(np.float32)
 
             pred = predict_video(model, chunk)
@@ -256,7 +261,6 @@ if uploaded_video is not None:
 
             elapsed = time.time() - start_time
             current_fps = processed_frames / elapsed if elapsed > 0 else 0
-
             progress_bar.progress(min(end / num_frames, 1.0))
             frame_text.markdown(f"**Frames Processed:** {processed_frames}/{num_frames}")
             fps_text.markdown(f"**Processing FPS:** {current_fps:.2f}")
@@ -269,22 +273,17 @@ if uploaded_video is not None:
 
         with col2:
             st.subheader("📤 Processed Video")
-
             if os.path.exists(output_path):
                 with open(output_path, "rb") as f:
                     video_bytes = f.read()
-
                 st.video(video_bytes)
-
                 st.download_button(
                     label="⬇️ Download Processed Video",
                     data=video_bytes,
                     file_name="processed_video.mp4",
                     mime="video/mp4"
                 )
-
                 st.info("⚠️ File will auto-delete after 5 minutes.")
-
             else:
                 st.error("Output video failed.")
 
