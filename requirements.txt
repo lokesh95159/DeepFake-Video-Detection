@@ -1,5 +1,6 @@
 streamlit==1.28.1
 opencv-python==4.8.1.78
 numpy==1.24.3
-tensorflow==2.15.0
+tensorflow==2.16.1
+keras==3.3.3
 requests==2.31.0
